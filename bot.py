@@ -37,7 +37,7 @@ from collections import namedtuple
 import requests
 
 os.environ.setdefault("MPLBACKEND", "Agg")
-CODE_VERSION = "P12-BOT 1.2.0 · 2026-10-02 · motor P12 v4.2"
+CODE_VERSION = "P12-BOT 1.3.0 · 2026-10-08 · motor P12 v4.2 · protección dinero real"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("p12")
@@ -149,6 +149,9 @@ FUND_PCT = _f("FUND_PCT", 0.01)                          # solo si no hay histó
 EXIT_FUND = _b("EXIT_FUND", False)
 
 LEVERAGE = _i("LEVERAGE", 10)
+MAX_RISK_USDT = _f("MAX_RISK_USDT", 0.0)                  # tope duro de pérdida por operación en USDT (0 = sin tope)
+MAX_DD_PCT = _f("MAX_DD_PCT", 10.0)                       # drawdown desde el máximo de equity que pausa las entradas (0 = off)
+HEARTBEAT_H = _f("HEARTBEAT_H", 6.0)                      # latido con saldo real cada N horas (0 = off)
 MAX_POS = _i("MAX_POS", 3)
 MAX_SAME_DIR = _i("MAX_SAME_DIR", 2)
 CORR_SCALE = _f("CORR_SCALE", 0.5)
@@ -1100,6 +1103,8 @@ def risk_text():
          f"Riesgo por operación {RISK_PCT:g}% · apalancamiento {LEVERAGE}x",
          f"Hoy ({rk.get('day', '—')}): {rk.get('dayR', 0):+.2f}R · límite −{MAX_DAILY_LOSS_R:g}R",
          f"Racha de pérdidas: {rk.get('consec', 0)} · pausa automática a {MAX_CONSEC_LOSS}",
+         f"Drawdown: {rk.get('dd', 0.0):.1f}% (máx. equity {rk.get('peak', 0):.2f}) · pausa a {MAX_DD_PCT:g}%"
+         + (f" · tope {MAX_RISK_USDT:g} USDT por operación" if MAX_RISK_USDT > 0 else ""),
          f"Máx. posiciones {MAX_POS} · misma dirección {MAX_SAME_DIR} (2ª ×{CORR_SCALE:g})",
          "Abiertas: " + (", ".join(f"{s} {'▲' if L_['dir'] == 1 else '▼'}" for s, L_ in STATE["live"].items()) or "ninguna")]
     return "\n".join(L)
@@ -1153,7 +1158,7 @@ def digest_text(td):
 
 
 HELP = ("<b>P12 Hunter bot</b>\n/estado — qué hacer ahora en cada símbolo\n/hoy [SÍMBOLO] — tarjeta + gráfico\n"
-        "/stats — expectativa, t y desgloses\n/riesgo — límites y posiciones\n/backtest [días] [top] — mismo motor sobre histórico BingX\n"
+        "/stats — expectativa, t y desgloses\n/riesgo — límites y posiciones\n/saldo — equity y posiciones reales en BingX\n/backtest [días] [top] — mismo motor sobre histórico BingX\n"
         "/pausa · /reanuda — ejecución (LIVE)\n/cerrar SÍMBOLO — cerrar posición del bot a mercado")
 
 
@@ -1607,8 +1612,11 @@ def risk_gate(sym, S, d):
     if same >= MAX_SAME_DIR:
         return f"⚠️ ya hay {same} posiciones en la misma dirección (correlación): no se ejecuta"
     rk = STATE["risk"]
-    if rk.get("day") == str(S["td"]) and rk.get("dayR", 0) <= -MAX_DAILY_LOSS_R:
-        return f"🛑 límite de pérdida diaria alcanzado ({rk['dayR']:+.2f}R): no se ejecuta"
+    dr = rk.get("dayR", 0.0) if rk.get("day") == str(S["td"]) else 0.0
+    if not DRY_RUN and rk.get("dayL") == str(S["td"]):
+        dr = min(dr, rk.get("dayRL", 0.0))                    # el R real de BingX (comisiones y deslizamiento incluidos)
+    if dr <= -MAX_DAILY_LOSS_R:
+        return f"🛑 límite de pérdida diaria alcanzado ({dr:+.2f}R): no se ejecuta"
     return ""
 
 
@@ -1641,7 +1649,10 @@ def live_open(sym, S, e):
                 return f"✋ el precio se escapó {slip:.2f}R desde la señal: no se persigue"
             rU = abs(px - stop)
             eq, av = BX.balance()
-            q = min(eq * RISK_PCT / 100 / rU * mult, av * LEVERAGE * 0.9 / px)
+            risk_usdt = eq * RISK_PCT / 100 * mult
+            if MAX_RISK_USDT > 0:
+                risk_usdt = min(risk_usdt, MAX_RISK_USDT)
+            q = min(risk_usdt / rU, av * LEVERAGE * 0.9 / px)
             qs = fq(sym, q)
             if float(qs) <= 0 or float(qs) < c.get("minq", 0) or float(qs) * px < c.get("minusdt", 0):
                 return f"⚠️ tamaño {qs} bajo el mínimo del contrato: no se ejecuta"
@@ -1691,7 +1702,25 @@ def live_open(sym, S, e):
                     f"SL en BingX · TP real <code>{fp(sym, tp)}</code>{warn}")
         except Exception as ex:
             log.exception("live_open")
-            return f"🚨 error al ejecutar: {esc(ex)[:200]}"
+            extra = ""
+            try:                                                 # ¿llegó a abrirse algo sin quedar registrado?
+                if sym not in STATE["live"] and BX.position(sym, d):
+                    extra = " · " + emergency_flatten(sym, d)
+            except Exception as ex2:
+                extra = f" · 🚨 REVISA {sym} EN BINGX A MANO ({esc(ex2)[:80]})"
+            return f"🚨 error al ejecutar: {esc(ex)[:200]}{extra}"
+
+
+def emergency_flatten(sym, d):
+    """Cierra a mercado una posición que el bot no puede gestionar y limpia sus órdenes."""
+    try:
+        p = BX.position(sym, d)
+        if p:
+            BX.order(sym, "SELL" if d == 1 else "BUY", BX.pside(d), "MARKET", fq(sym, p["amt"]), reduce=True)
+        BX.cancel_all(sym)
+        return "posición sin gestión cerrada a mercado por seguridad"
+    except Exception as ex:
+        return f"🚨 NO SE PUDO CERRAR {sym} ({esc(ex)[:80]}): ciérrala a mano"
 
 
 def live_be(sym):
@@ -1719,8 +1748,14 @@ def finish_live(sym, L, how):
         pnl = BX.realized(sym, L["t_open"])
         risk = float(L["amt"]) * L["rU"]
         R = pnl / risk if risk > 0 else None
-        STATE["live_res"].append(dict(key=L.get("key"), sym=sym, R=R, pnl=pnl, slip=L.get("slip", 0.0)))
+        STATE["live_res"].append(dict(key=L.get("key"), sym=sym, R=R, pnl=pnl, slip=L.get("slip", 0.0), t=now_ms()))
         STATE["live_res"] = STATE["live_res"][-1000:]
+        if R is not None:
+            rk = STATE["risk"]
+            td = str(L.get("td"))
+            if rk.get("dayL") != td:
+                rk["dayL"], rk["dayRL"] = td, 0.0
+            rk["dayRL"] = rk.get("dayRL", 0.0) + R
         if R is not None:
             msg += f" · real <b>{R:+.2f}R</b> ({pnl:+.2f} USDT)"
     except Exception as ex:
@@ -1761,6 +1796,83 @@ def reconcile(sym):
             tg.send(msg, silent=True, reply=D.get("entry"))
     except Exception as ex:
         log.warning(f"{sym} reconcile: {ex}")
+
+
+ORPHAN_SEEN = set()
+HB = [0.0]
+
+
+def all_positions():
+    return [x for x in (BX.req("GET", "/openApi/swap/v2/user/positions") or []) if float(x.get("positionAmt", 0) or 0) != 0]
+
+
+def equity_guard():
+    """Cada ciclo en dinero real: máximo de equity y drawdown, posiciones ajenas al bot, latido."""
+    if not (LIVE and not DRY_RUN and BX_KEY and BX_SECRET):
+        return
+    try:
+        eq, av = BX.balance()
+    except Exception as ex:
+        log.warning(f"equity_guard saldo: {ex}")
+        return
+    rk = STATE["risk"]
+    if eq > rk.get("peak", 0):
+        rk["peak"] = eq
+    dd = 100 * (1 - eq / rk["peak"]) if rk.get("peak", 0) > 0 else 0.0
+    rk["dd"] = dd
+    if MAX_DD_PCT > 0 and dd >= MAX_DD_PCT and not STATE["paused"]:
+        STATE["paused"] = True
+        tg.send(f"⏸ <b>Pausa por drawdown</b>: equity {eq:.2f} USDT, {dd:.1f}% bajo el máximo ({rk['peak']:.2f}). "
+                f"No se abrirán entradas nuevas; las posiciones abiertas siguen gestionándose. "
+                f"/reanuda reinicia el máximo al saldo actual.")
+    try:
+        mine = {(s, L_["dir"]) for s, L_ in STATE["live"].items() if not L_.get("dry")}
+        for x in all_positions():
+            sym = x.get("symbol")
+            amt = float(x["positionAmt"])
+            ps = str(x.get("positionSide", "BOTH")).upper()
+            xd = 1 if ps == "LONG" else -1 if ps == "SHORT" else (1 if amt > 0 else -1)
+            k = (sym, xd, str(datetime.now(TZ_NY).date()))
+            if (sym, xd) not in mine and k not in ORPHAN_SEEN:
+                ORPHAN_SEEN.add(k)
+                tg.send(f"⚠️ Posición en BingX que el bot NO gestiona: <b>{sym}</b> {'▲' if xd == 1 else '▼'} {abs(amt):g}. "
+                        f"¿Manual u otra instancia del bot con la misma API key? Revisa que no haya dos bots operando.")
+    except Exception as ex:
+        log.warning(f"equity_guard posiciones: {ex}")
+    if HEARTBEAT_H > 0 and time.time() - HB[0] >= HEARTBEAT_H * 3600:
+        HB[0] = time.time()
+        tg.send(heartbeat_text(eq, av), silent=True)
+
+
+def real_24h():
+    cut = now_ms() - 24 * 3600_000
+    return [x for x in STATE["live_res"] if x.get("R") is not None and x.get("t", cut + 1) >= cut]
+
+
+def heartbeat_text(eq, av):
+    rk = STATE["risk"]
+    n = len([1 for L_ in STATE["live"].values() if not L_.get("dry")])
+    r24 = real_24h()
+    wl = f"{sum(1 for x in r24 if x['R'] > 0)}G/{sum(1 for x in r24 if x['R'] <= 0)}P 24h · "
+    return (f"💓 <b>Latido</b> · equity <b>{eq:.2f}</b> USDT (libre {av:.2f}) · posiciones {n}/{MAX_POS} · {wl}"
+            f"hoy {rk.get('dayRL', 0.0) if rk.get('dayL') == str(datetime.now(TZ_NY).date()) else 0.0:+.2f}R real · "
+            f"DD {rk.get('dd', 0.0):.1f}% (pausa a {MAX_DD_PCT:g}%)" + (" · ⏸ PAUSADO" if STATE["paused"] else ""))
+
+
+def saldo_text():
+    if not (BX_KEY and BX_SECRET):
+        return "Sin API key de BingX configurada."
+    try:
+        eq, av = BX.balance()
+        pos = all_positions()
+    except Exception as ex:
+        return f"🚨 No pude leer BingX: {esc(ex)[:150]}"
+    L = [f"💰 <b>Saldo real</b> · equity {eq:.2f} USDT · libre {av:.2f}" + (" · 🧪 DRY_RUN (no se opera)" if DRY_RUN else "")]
+    for x in pos:
+        L.append(f"• {x.get('symbol')} {x.get('positionSide', '')} {float(x['positionAmt']):g} @ {x.get('avgPrice')} · PnL no realizado {x.get('unrealizedProfit', '—')}")
+    if not pos:
+        L.append("Sin posiciones abiertas en BingX.")
+    return "\n".join(L)
 
 
 # ───────────────────────── ESTADO EN DISCO ─────────────────────────
@@ -2051,6 +2163,7 @@ def cycle(end_ms):
         STATE["digest"].append(str(td))
         tg.send(digest_text(td), silent=True)
     keepalive()
+    equity_guard()
     save_state()
     LAST_CYCLE[0] = time.time()
     HEALTH["last_cycle"] = datetime.now(timezone.utc).isoformat()
@@ -2160,6 +2273,8 @@ def on_cmd(cmd, args, uid, chat):
         tg.send(stats_text())
     elif cmd == "/riesgo":
         tg.send(risk_text())
+    elif cmd == "/saldo":
+        tg.send(saldo_text())
     elif cmd == "/hoy":
         dflt = (STATE.get("uni", {}).get("active") or []) if UNIVERSE else SYMBOLS
         for s in ([_sym(args[0])] if args else dflt):
@@ -2183,8 +2298,9 @@ def on_cmd(cmd, args, uid, chat):
         elif cmd == "/reanuda":
             STATE["paused"] = False
             STATE["risk"]["consec"] = 0
+            STATE["risk"]["peak"] = 0.0                       # el máximo se reinicia al saldo actual
             save_state()
-            tg.send("▶️ Reanudado (racha de pérdidas a cero).")
+            tg.send("▶️ Reanudado (racha de pérdidas y máximo de equity reiniciados).")
         else:
             if not args:
                 tg.send("Uso: /cerrar SÍMBOLO")
@@ -2225,6 +2341,12 @@ def main():
     load_state()
     for k, v in (("risk", {}), ("live_res", []), ("keepalive", "")):
         STATE.setdefault(k, v)
+    if LIVE and not DRY_RUN:                                   # las "posiciones" de la etapa DRY_RUN no existen en BingX
+        stale = [s for s, L_ in STATE["live"].items() if L_.get("dry")]
+        for s in stale:
+            STATE["live"].pop(s, None)
+        if stale:
+            log.info(f"descartadas {len(stale)} posiciones simuladas de DRY_RUN: {stale}")
     if UNIVERSE:
         build_universe()
     else:
@@ -2237,6 +2359,13 @@ def main():
         eq, av = BX.balance()
         USER_TAKER[0] = BX.commission()
         log.info(f"BingX hedge={BX.is_hedge()} equity={eq:.2f} disponible={av:.2f} taker={USER_TAKER[0]}")
+        STATE["risk"]["peak"] = max(STATE["risk"].get("peak", 0.0), eq)
+        if eq <= 0:
+            tg.send("⚠️ <b>DINERO REAL activo pero el saldo USDT de futuros perpetuos es 0.</b> "
+                    "Transfiere fondos a la cuenta de Futuros Perpetuos de BingX; sin ellos no se ejecutará nada.")
+        else:
+            tg.send(f"💵 <b>DINERO REAL ACTIVO</b> · equity {eq:.2f} USDT · riesgo {RISK_PCT:g}% ≈ {eq * RISK_PCT / 100:.2f} USDT/op"
+                    + (f" (tope {MAX_RISK_USDT:g})" if MAX_RISK_USDT > 0 else "") + f" · pausa por DD {MAX_DD_PCT:g}% · /saldo /riesgo /pausa")
     if not tg.on:
         log.warning("Telegram sin configurar: solo logs")
     tg.set_commands()
