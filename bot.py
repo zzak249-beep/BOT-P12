@@ -34,10 +34,12 @@ from zoneinfo import ZoneInfo
 from urllib.parse import quote
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import namedtuple
+from statistics import NormalDist
+import re
 import requests
 
 os.environ.setdefault("MPLBACKEND", "Agg")
-CODE_VERSION = "P12-BOT 1.3.0 · 2026-10-08 · motor P12 v4.2 · protección dinero real"
+CODE_VERSION = "P12-BOT 1.3.0 · 2026-10-07 · motor P12 v4.2 + blindaje LIVE"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("p12")
@@ -149,9 +151,6 @@ FUND_PCT = _f("FUND_PCT", 0.01)                          # solo si no hay histó
 EXIT_FUND = _b("EXIT_FUND", False)
 
 LEVERAGE = _i("LEVERAGE", 10)
-MAX_RISK_USDT = _f("MAX_RISK_USDT", 0.0)                  # tope duro de pérdida por operación en USDT (0 = sin tope)
-MAX_DD_PCT = _f("MAX_DD_PCT", 10.0)                       # drawdown desde el máximo de equity que pausa las entradas (0 = off)
-HEARTBEAT_H = _f("HEARTBEAT_H", 6.0)                      # latido con saldo real cada N horas (0 = off)
 MAX_POS = _i("MAX_POS", 3)
 MAX_SAME_DIR = _i("MAX_SAME_DIR", 2)
 CORR_SCALE = _f("CORR_SCALE", 0.5)
@@ -159,6 +158,9 @@ MAX_DAILY_LOSS_R = _f("MAX_DAILY_LOSS_R", 3.0)
 MAX_CONSEC_LOSS = _i("MAX_CONSEC_LOSS", 6)
 ENTRY_MAX_SLIP_R = _f("ENTRY_MAX_SLIP_R", 0.30)
 MAX_GAPS = _i("MAX_GAPS", 3)
+MAX_DD_PCT = _f("MAX_DD_PCT", 8.0)              # caída del equity desde su máximo (%) → pausa hasta /reanuda (0 = off)
+MAX_ACCOUNT_POS = _i("MAX_ACCOUNT_POS", 4)      # posiciones de TODA la cuenta (otros bots y manuales también cuentan; 0 = off)
+GUARD_STOPS = _b("GUARD_STOPS", True)           # cada ciclo repone el SL/TP de una posición del bot si falta en BingX
 MIN_N = _i("MIN_N", 20)
 STALE_SEC = _i("STALE_SEC", 240)
 CYCLE_DELAY = _i("CYCLE_DELAY", 5)
@@ -267,6 +269,16 @@ def ses():
     return s
 
 
+class MDBlocked(RuntimeError):
+    """109429: BingX bloquea la ruta de velas por exceso de errores; se reintenta cuando ellos digan."""
+
+
+class MDPaused(RuntimeError):
+    """109415: contrato pausado (mercado cerrado / suspendido). No se le piden velas durante horas."""
+
+
+MD_BLOCK = {"until": 0.0, "alert": 0.0}
+PAUSED = {}                 # símbolo → epoch hasta el que no se le piden velas
 MD_LOCK = threading.Lock()
 MD_LAST = [0.0]
 MD_DYN = [MD_GAP]          # separación adaptativa: sube con 100410, baja poco a poco
@@ -274,6 +286,8 @@ MD_DYN = [MD_GAP]          # separación adaptativa: sube con 100410, baja poco 
 
 def md_get(path, params=None):
     """Datos públicos BingX: limitador global adaptativo, backoff ante 100410, .pro solo si falla la red."""
+    if path.endswith("/klines") and MD_BLOCK["until"] > time.time():      # no golpear una ruta bloqueada: alarga el bloqueo
+        raise MDBlocked(f"{path}: bloqueada por BingX {int(MD_BLOCK['until'] - time.time())}s más")
     for a in range(6):
         with MD_LOCK:
             w = MD_LAST[0] + MD_DYN[0] - time.time()
@@ -292,6 +306,12 @@ def md_get(path, params=None):
         if j is None:
             time.sleep(1 + a)
             continue
+        if str(j.get("code")) == "109429":
+            m = re.search(r"retry after time:\s*(\d+)", str(j.get("msg", "")))
+            MD_BLOCK["until"] = (int(m.group(1)) / 1000.0 if m else time.time() + 300) + 2
+            raise MDBlocked(f"{path} 109429: rate limit de BingX")
+        if str(j.get("code")) == "109415":
+            raise MDPaused(f"{path} 109415: {str(j.get('msg', ''))[:80]}")
         if j.get("code") == 100410:
             MD_DYN[0] = min(1.2, MD_DYN[0] * 1.5)
             time.sleep(min(0.2 * 2 ** a, 5) + random.random())
@@ -313,13 +333,22 @@ IV_MS = {"5m": BAR_MS, "1h": 3_600_000}
 
 
 def klines(sym, interval, limit, end_ms=None, start_ms=None):
+    if PAUSED.get(sym, 0.0) > time.time():
+        raise MDPaused(f"{sym} pausado")
     p = {"symbol": sym, "interval": interval, "limit": limit}
     if start_ms:
         p["startTime"] = start_ms
     if end_ms and start_ms:
         p["endTime"] = end_ms - 1
     out = {}
-    for x in md_get("/openApi/swap/v3/quote/klines", p) or []:
+    try:
+        data = md_get("/openApi/swap/v3/quote/klines", p) or []
+    except MDPaused:
+        if PAUSED.get(sym, 0.0) <= time.time():
+            log.info(f"{sym} pausado en BingX: sin velas durante 6 h")
+        PAUSED[sym] = time.time() + 6 * 3600
+        raise
+    for x in data:
         b = _bar(x)
         out[b.t] = b
     bars = [out[k] for k in sorted(out)]
@@ -375,7 +404,7 @@ def build_universe():
     for x in (d if isinstance(d, list) else [d]):
         s = x.get("symbol", "")
         c = CONTRACT.get(s)
-        if not s.endswith("-USDT") or not c or not c.get("open") or s in EXCLUDE:
+        if not s.endswith("-USDT") or not c or not c.get("open") or s in EXCLUDE or PAUSED.get(s, 0.0) > time.time():
             continue
         qv = float(x.get("quoteVolume") or 0)
         bid, ask = float(x.get("bidPrice") or 0), float(x.get("askPrice") or 0)
@@ -599,8 +628,10 @@ def new_snap(sym, td):
                 limit=None, cost=COST_RT_NUM, news=None, last_t=None, last_c=None, last_h=None, last_l=None)
 
 
-def simulate(sym, bars, td, wmed, btc_rd, btc_now, is_btc, cost=None, fund=None, news=None):
+def simulate(sym, bars, td, wmed, btc_rd, btc_now, is_btc, cost=None, fund=None, news=None, F=None):
     S = new_snap(sym, td)
+    fl = dict(NIGHT=NIGHT_FILTER, BTC=BTC_FILTER, MO=MO_FILTER, W=WIDTH_FILTER, NEWS=NEWS_FILTER, MIS=MISMATCH)
+    fl.update(F or {})   # solo el sweep lo usa: NO se tocan las variables globales con el bot operando
     S["btcNow"], S["isBtc"], S["news"] = btc_now, is_btc, news
     S["cost"] = COST_RT_NUM if cost is None else cost
     cost = S["cost"]
@@ -769,12 +800,12 @@ def simulate(sym, bars, td, wmed, btc_rd, btc_now, is_btc, cost=None, fund=None,
                 S["openDone"], S["opx"], S["atr"] = True, b.o, atr[i]
                 rd, mo = S["rd"], S["moPx"]
                 S["moFav"] = False if mo is None else (b.o > mo if rd == 1 else b.o < mo if rd == -1 else False)
-                S["nightOk"] = True if NIGHT_FILTER == "NONE" else (S["scen"] != 3 if NIGHT_FILTER == "EXCL_BOTH" else (S["scen"] == 1 and S["nDir"] == rd))
-                S["btcOk"] = True if (BTC_FILTER == "OFF" or is_btc) else (S["btcRd"] != -rd if BTC_FILTER == "NOT_AGAINST" else S["btcRd"] == rd)
-                S["moOk"] = True if (MO_FILTER == "OFF" or mo is None) else (S["moFav"] if MO_FILTER == "FAVOR" else not S["moFav"])
-                S["wOk"] = {"OFF": True, "EXCL_NARROW": S["wB"] != 0, "EXCL_WIDE": S["wB"] != 2}.get(WIDTH_FILTER, S["wB"] == 1)
+                S["nightOk"] = True if fl["NIGHT"] == "NONE" else (S["scen"] != 3 if fl["NIGHT"] == "EXCL_BOTH" else (S["scen"] == 1 and S["nDir"] == rd))
+                S["btcOk"] = True if (fl["BTC"] == "OFF" or is_btc) else (S["btcRd"] != -rd if fl["BTC"] == "NOT_AGAINST" else S["btcRd"] == rd)
+                S["moOk"] = True if (fl["MO"] == "OFF" or mo is None) else (S["moFav"] if fl["MO"] == "FAVOR" else not S["moFav"])
+                S["wOk"] = {"OFF": True, "EXCL_NARROW": S["wB"] != 0, "EXCL_WIDE": S["wB"] != 2}.get(fl["W"], S["wB"] == 1)
                 nr, nh = bool(news and news["read"]), bool(news and news["hold"])
-                S["newsOk"] = {"OFF": True, "EXCL_READ": not nr, "EXCL_HOLD": not nh}.get(NEWS_FILTER, not (nr or nh))
+                S["newsOk"] = {"OFF": True, "EXCL_READ": not nr, "EXCL_HOLD": not nh}.get(fl["NEWS"], not (nr or nh))
                 ok = rd != 0 and S["nightOk"] and S["btcOk"] and S["moOk"] and S["wOk"] and S["newsOk"] and not S["dataBad"]
                 S["bias"] = rd if ok else 0
                 a = atr[i] or 0.0
@@ -784,7 +815,7 @@ def simulate(sym, bars, td, wmed, btc_rd, btc_now, is_btc, cost=None, fund=None,
                 elif S["bias"] == -1:
                     S["zEdge"], S["zDeep"], S["stop"] = S["pL"], S["pM"], S["pM"] + STOP_BUF * a
                     S["coinc"] = b.o <= S["pM"] if COINC_MODE == "MID" else b.o < S["pL"]
-                S["szMult"] = 0.0 if S["bias"] == 0 else 1.0 if S["coinc"] else (0.0 if MISMATCH == "DISCARD" else REDUCE_F)
+                S["szMult"] = 0.0 if S["bias"] == 0 else 1.0 if S["coinc"] else (0.0 if fl["MIS"] == "DISCARD" else REDUCE_F)
                 emit("open", tc)
 
         # (3) entradas al cierre de vela
@@ -1101,10 +1132,9 @@ def risk_text():
     rk = STATE["risk"]
     L = [f"🛡 <b>Riesgo</b> · {MODE}" + (" DRY_RUN" if LIVE and DRY_RUN else "") + (" · ⏸ PAUSADO" if STATE["paused"] else ""),
          f"Riesgo por operación {RISK_PCT:g}% · apalancamiento {LEVERAGE}x",
-         f"Hoy ({rk.get('day', '—')}): {rk.get('dayR', 0):+.2f}R · límite −{MAX_DAILY_LOSS_R:g}R",
-         f"Racha de pérdidas: {rk.get('consec', 0)} · pausa automática a {MAX_CONSEC_LOSS}",
-         f"Drawdown: {rk.get('dd', 0.0):.1f}% (máx. equity {rk.get('peak', 0):.2f}) · pausa a {MAX_DD_PCT:g}%"
-         + (f" · tope {MAX_RISK_USDT:g} USDT por operación" if MAX_RISK_USDT > 0 else ""),
+         f"Hoy ({rk.get('day', '—')}): señales {rk.get('dayR', 0):+.2f}R · límite −{MAX_DAILY_LOSS_R:g}R",
+         f"Hoy REAL: {real_risk().get('dayR', 0):+.2f}R · racha real {real_risk().get('consec', 0)} (señales {rk.get('consec', 0)}) · pausa a {MAX_CONSEC_LOSS}",
+         f"Equity: máximo {STATE.get('hwm', 0):.2f} USDT · pausa si cae {MAX_DD_PCT:g}% · tope de cuenta {MAX_ACCOUNT_POS} posiciones",
          f"Máx. posiciones {MAX_POS} · misma dirección {MAX_SAME_DIR} (2ª ×{CORR_SCALE:g})",
          "Abiertas: " + (", ".join(f"{s} {'▲' if L_['dir'] == 1 else '▼'}" for s, L_ in STATE["live"].items()) or "ninguna")]
     return "\n".join(L)
@@ -1158,8 +1188,8 @@ def digest_text(td):
 
 
 HELP = ("<b>P12 Hunter bot</b>\n/estado — qué hacer ahora en cada símbolo\n/hoy [SÍMBOLO] — tarjeta + gráfico\n"
-        "/stats — expectativa, t y desgloses\n/riesgo — límites y posiciones\n/saldo — equity y posiciones reales en BingX\n/backtest [días] [top] — mismo motor sobre histórico BingX\n"
-        "/pausa · /reanuda — ejecución (LIVE)\n/cerrar SÍMBOLO — cerrar posición del bot a mercado")
+        "/stats — expectativa, t y desgloses\n/riesgo — límites y posiciones\n/backtest [días] [top] — mismo motor sobre histórico BingX\n"
+        "/sweep [días] [top] — ¿qué filtros separan de verdad? (70/30 + Bonferroni)\n/pausa · /reanuda — ejecución (LIVE)\n/hwm — reiniciar el máximo de equity\n/cerrar SÍMBOLO — cerrar posición del bot a mercado")
 
 
 # ───────────────────────── GRÁFICO ─────────────────────────
@@ -1502,6 +1532,19 @@ class BingX:
         return [x for x in (self.req("GET", "/openApi/swap/v2/user/positions", {"symbol": sym}) or [])
                 if float(x.get("positionAmt", 0) or 0) != 0]
 
+    def all_positions(self):
+        return [x for x in (self.req("GET", "/openApi/swap/v2/user/positions") or [])
+                if float(x.get("positionAmt", 0) or 0) != 0]
+
+    def open_orders(self, sym):
+        """Lista de órdenes abiertas o None si la consulta falla (None ≠ «no hay órdenes»)."""
+        try:
+            d = self.req("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": sym}) or {}
+            return d.get("orders", []) if isinstance(d, dict) else list(d)
+        except Exception as ex:
+            log.warning(f"{sym} órdenes abiertas: {ex}")
+            return None
+
     def position(self, sym, d):
         for x in self.positions(sym):
             amt = float(x["positionAmt"])
@@ -1611,13 +1654,104 @@ def risk_gate(sym, S, d):
     same = sum(1 for L in STATE["live"].values() if L.get("dir") == d)
     if same >= MAX_SAME_DIR:
         return f"⚠️ ya hay {same} posiciones en la misma dirección (correlación): no se ejecuta"
-    rk = STATE["risk"]
-    dr = rk.get("dayR", 0.0) if rk.get("day") == str(S["td"]) else 0.0
-    if not DRY_RUN and rk.get("dayL") == str(S["td"]):
-        dr = min(dr, rk.get("dayRL", 0.0))                    # el R real de BingX (comisiones y deslizamiento incluidos)
-    if dr <= -MAX_DAILY_LOSS_R:
-        return f"🛑 límite de pérdida diaria alcanzado ({dr:+.2f}R): no se ejecuta"
+    rk = real_risk() if (LIVE and not DRY_RUN) else STATE["risk"]
+    if rk.get("day") == str(S["td"]) and rk.get("dayR", 0) <= -MAX_DAILY_LOSS_R:
+        return f"🛑 límite de pérdida diaria alcanzado ({rk['dayR']:+.2f}R): no se ejecuta"
     return ""
+
+
+def real_risk():
+    """Contadores de las operaciones EJECUTADAS (R real de BingX). Los de STATE['risk'] cuentan también las
+    hipotéticas de todo el top seguido y solo sirven para la estadística de la señal."""
+    return STATE.setdefault("real", {})
+
+
+def real_risk_update(R):
+    if R is None:
+        return
+    rr = real_risk()
+    td = str(tdate(now_ms()))
+    if rr.get("day") != td:
+        rr["day"], rr["dayR"] = td, 0.0
+    rr["dayR"] = rr.get("dayR", 0.0) + R
+    rr["consec"] = rr.get("consec", 0) + 1 if R < 0 else 0
+    if MAX_CONSEC_LOSS and rr["consec"] >= MAX_CONSEC_LOSS and not STATE["paused"]:
+        STATE["paused"] = True
+        tg.send(f"⏸ <b>Pausa automática</b>: {rr['consec']} pérdidas REALES seguidas. Revisa /stats y usa /reanuda cuando decidas.")
+
+
+def acct_id():
+    return hashlib.sha256((BX_BASE + "|" + BX_KEY).encode()).hexdigest()[:10]
+
+
+def dd_update(eq):
+    """Máximo de equity histórico (por cuenta: si cambias de clave/demo no arrastra el máximo de otra) y caída actual en %."""
+    if STATE.get("hwm_acct") != acct_id():
+        STATE["hwm_acct"], STATE["hwm"] = acct_id(), eq
+    STATE["hwm"] = max(STATE.get("hwm", 0.0), eq)
+    hw = STATE["hwm"]
+    return (hw - eq) / hw * 100 if hw > 0 else 0.0
+
+
+def equity_guard():
+    """Cortacircuitos de equity: pausa las aperturas si cae MAX_DD_PCT % desde su máximo."""
+    if not (LIVE and not DRY_RUN) or MAX_DD_PCT <= 0:
+        return
+    eq, _ = BX.balance()
+    dd = dd_update(eq)
+    if dd >= MAX_DD_PCT and not STATE["paused"]:
+        STATE["paused"] = True
+        save_state()
+        tg.send(f"🛑 <b>Equity {eq:.2f} USDT: -{dd:.1f}% desde el máximo ({STATE['hwm']:.2f})</b> ≥ {MAX_DD_PCT:g}%. Bot PAUSADO. "
+                f"Si has retirado fondos usa /hwm; si no, revisa antes de /reanuda.")
+
+
+def guard_stops():
+    """Cada ciclo: toda posición del bot debe tener SL (y TP) vivos en BingX; si falta uno, se repone."""
+    if not (LIVE and not DRY_RUN and GUARD_STOPS):
+        return
+    for sym, L in list(STATE["live"].items()):
+        if L.get("dry"):
+            continue
+        with BX.lock:
+            orders = BX.open_orders(sym)
+            if orders is None:                      # no se pudo consultar: no inventar que falta
+                continue
+            try:
+                p = BX.position(sym, L["dir"])
+            except Exception as ex:
+                log.warning(f"{sym} guardián posición: {ex}")
+                continue
+            if not p:                               # cerrada: de eso se ocupa reconcile()
+                continue
+            ps, cs = BX.pside(L["dir"]), "SELL" if L["dir"] == 1 else "BUY"
+            same = [o for o in orders if str(o.get("positionSide", ps)).upper() == ps]
+            has_sl = any(o.get("type") in ("STOP_MARKET", "STOP") for o in same)
+            has_tp = any(o.get("type") in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT") for o in same)
+            amt = fq(sym, p["amt"])
+            if not has_sl:
+                try:
+                    L["sl_id"] = BX.order(sym, cs, ps, "STOP_MARKET", amt, stop=fpx(sym, L["sl"]), reduce=True)
+                    tg.send(f"🛡 <b>{sym}</b>: el SL no estaba en BingX → repuesto en <code>{fp(sym, L['sl'])}</code>")
+                except Exception as ex:
+                    breached = False
+                    try:
+                        breached = (mark_price(sym) - L["sl"]) * L["dir"] <= 0
+                    except Exception:
+                        pass
+                    if breached:
+                        tg.send(f"🚨 <b>{sym}</b>: sin SL y el precio ya lo pasó ({esc(ex)[:80]}): cierro a mercado")
+                        BX.order(sym, cs, ps, "MARKET", amt, reduce=True)
+                    else:
+                        tg.send(f"🚨 <b>{sym}</b>: SIN STOP en BingX y no se pudo reponer ({esc(ex)[:100]}). Ciérrala a mano o usa /cerrar {sym}")
+            if not has_tp and L.get("tp") and not L.get("tp_warned"):
+                try:
+                    L["tp_id"] = BX.order(sym, cs, ps, "TAKE_PROFIT_MARKET", amt, stop=fpx(sym, L["tp"]), reduce=True)
+                    tg.send(f"🛡 <b>{sym}</b>: el TP no estaba en BingX → repuesto en <code>{fp(sym, L['tp'])}</code>")
+                except Exception as ex:
+                    L["tp_warned"] = True
+                    tg.send(f"⚠️ <b>{sym}</b>: sin TP en BingX y no se pudo reponer ({esc(ex)[:100]})")
+    save_state()
 
 
 def live_open(sym, S, e):
@@ -1641,6 +1775,10 @@ def live_open(sym, S, e):
                 return "⚠️ mantenimiento del contrato en curso o inminente"
             if BX.positions(sym):
                 return "⚠️ ya hay una posición abierta en BingX (manual u otro bot): no se ejecuta"
+            if MAX_ACCOUNT_POS:
+                n_acc = len({(x.get("symbol"), str(x.get("positionSide", "BOTH")).upper()) for x in BX.all_positions()})
+                if n_acc >= MAX_ACCOUNT_POS:
+                    return f"⚠️ la cuenta ya tiene {n_acc} posiciones abiertas (MAX_ACCOUNT_POS={MAX_ACCOUNT_POS}): no se ejecuta"
             px = mark_price(sym)
             if (px - stop) * d <= 0:
                 return "✋ el precio ya está al otro lado del stop: no se ejecuta"
@@ -1649,10 +1787,13 @@ def live_open(sym, S, e):
                 return f"✋ el precio se escapó {slip:.2f}R desde la señal: no se persigue"
             rU = abs(px - stop)
             eq, av = BX.balance()
-            risk_usdt = eq * RISK_PCT / 100 * mult
-            if MAX_RISK_USDT > 0:
-                risk_usdt = min(risk_usdt, MAX_RISK_USDT)
-            q = min(risk_usdt / rU, av * LEVERAGE * 0.9 / px)
+            dd = dd_update(eq)
+            if MAX_DD_PCT > 0 and dd >= MAX_DD_PCT:
+                STATE["paused"] = True
+                save_state()
+                tg.send(f"🛑 Equity -{dd:.1f}% desde el máximo: bot PAUSADO (MAX_DD_PCT={MAX_DD_PCT:g}%).")
+                return f"🛑 equity -{dd:.1f}% desde el máximo: no se ejecuta"
+            q = min(eq * RISK_PCT / 100 / rU * mult, av * LEVERAGE * 0.9 / px)
             qs = fq(sym, q)
             if float(qs) <= 0 or float(qs) < c.get("minq", 0) or float(qs) * px < c.get("minusdt", 0):
                 return f"⚠️ tamaño {qs} bajo el mínimo del contrato: no se ejecuta"
@@ -1702,25 +1843,7 @@ def live_open(sym, S, e):
                     f"SL en BingX · TP real <code>{fp(sym, tp)}</code>{warn}")
         except Exception as ex:
             log.exception("live_open")
-            extra = ""
-            try:                                                 # ¿llegó a abrirse algo sin quedar registrado?
-                if sym not in STATE["live"] and BX.position(sym, d):
-                    extra = " · " + emergency_flatten(sym, d)
-            except Exception as ex2:
-                extra = f" · 🚨 REVISA {sym} EN BINGX A MANO ({esc(ex2)[:80]})"
-            return f"🚨 error al ejecutar: {esc(ex)[:200]}{extra}"
-
-
-def emergency_flatten(sym, d):
-    """Cierra a mercado una posición que el bot no puede gestionar y limpia sus órdenes."""
-    try:
-        p = BX.position(sym, d)
-        if p:
-            BX.order(sym, "SELL" if d == 1 else "BUY", BX.pside(d), "MARKET", fq(sym, p["amt"]), reduce=True)
-        BX.cancel_all(sym)
-        return "posición sin gestión cerrada a mercado por seguridad"
-    except Exception as ex:
-        return f"🚨 NO SE PUDO CERRAR {sym} ({esc(ex)[:80]}): ciérrala a mano"
+            return f"🚨 error al ejecutar: {esc(ex)[:200]}"
 
 
 def live_be(sym):
@@ -1748,16 +1871,11 @@ def finish_live(sym, L, how):
         pnl = BX.realized(sym, L["t_open"])
         risk = float(L["amt"]) * L["rU"]
         R = pnl / risk if risk > 0 else None
-        STATE["live_res"].append(dict(key=L.get("key"), sym=sym, R=R, pnl=pnl, slip=L.get("slip", 0.0), t=now_ms()))
+        STATE["live_res"].append(dict(key=L.get("key"), sym=sym, R=R, pnl=pnl, slip=L.get("slip", 0.0)))
         STATE["live_res"] = STATE["live_res"][-1000:]
         if R is not None:
-            rk = STATE["risk"]
-            td = str(L.get("td"))
-            if rk.get("dayL") != td:
-                rk["dayL"], rk["dayRL"] = td, 0.0
-            rk["dayRL"] = rk.get("dayRL", 0.0) + R
-        if R is not None:
             msg += f" · real <b>{R:+.2f}R</b> ({pnl:+.2f} USDT)"
+            real_risk_update(R)
     except Exception as ex:
         log.warning(f"{sym} PnL real: {ex}")
     save_state()
@@ -1796,83 +1914,6 @@ def reconcile(sym):
             tg.send(msg, silent=True, reply=D.get("entry"))
     except Exception as ex:
         log.warning(f"{sym} reconcile: {ex}")
-
-
-ORPHAN_SEEN = set()
-HB = [0.0]
-
-
-def all_positions():
-    return [x for x in (BX.req("GET", "/openApi/swap/v2/user/positions") or []) if float(x.get("positionAmt", 0) or 0) != 0]
-
-
-def equity_guard():
-    """Cada ciclo en dinero real: máximo de equity y drawdown, posiciones ajenas al bot, latido."""
-    if not (LIVE and not DRY_RUN and BX_KEY and BX_SECRET):
-        return
-    try:
-        eq, av = BX.balance()
-    except Exception as ex:
-        log.warning(f"equity_guard saldo: {ex}")
-        return
-    rk = STATE["risk"]
-    if eq > rk.get("peak", 0):
-        rk["peak"] = eq
-    dd = 100 * (1 - eq / rk["peak"]) if rk.get("peak", 0) > 0 else 0.0
-    rk["dd"] = dd
-    if MAX_DD_PCT > 0 and dd >= MAX_DD_PCT and not STATE["paused"]:
-        STATE["paused"] = True
-        tg.send(f"⏸ <b>Pausa por drawdown</b>: equity {eq:.2f} USDT, {dd:.1f}% bajo el máximo ({rk['peak']:.2f}). "
-                f"No se abrirán entradas nuevas; las posiciones abiertas siguen gestionándose. "
-                f"/reanuda reinicia el máximo al saldo actual.")
-    try:
-        mine = {(s, L_["dir"]) for s, L_ in STATE["live"].items() if not L_.get("dry")}
-        for x in all_positions():
-            sym = x.get("symbol")
-            amt = float(x["positionAmt"])
-            ps = str(x.get("positionSide", "BOTH")).upper()
-            xd = 1 if ps == "LONG" else -1 if ps == "SHORT" else (1 if amt > 0 else -1)
-            k = (sym, xd, str(datetime.now(TZ_NY).date()))
-            if (sym, xd) not in mine and k not in ORPHAN_SEEN:
-                ORPHAN_SEEN.add(k)
-                tg.send(f"⚠️ Posición en BingX que el bot NO gestiona: <b>{sym}</b> {'▲' if xd == 1 else '▼'} {abs(amt):g}. "
-                        f"¿Manual u otra instancia del bot con la misma API key? Revisa que no haya dos bots operando.")
-    except Exception as ex:
-        log.warning(f"equity_guard posiciones: {ex}")
-    if HEARTBEAT_H > 0 and time.time() - HB[0] >= HEARTBEAT_H * 3600:
-        HB[0] = time.time()
-        tg.send(heartbeat_text(eq, av), silent=True)
-
-
-def real_24h():
-    cut = now_ms() - 24 * 3600_000
-    return [x for x in STATE["live_res"] if x.get("R") is not None and x.get("t", cut + 1) >= cut]
-
-
-def heartbeat_text(eq, av):
-    rk = STATE["risk"]
-    n = len([1 for L_ in STATE["live"].values() if not L_.get("dry")])
-    r24 = real_24h()
-    wl = f"{sum(1 for x in r24 if x['R'] > 0)}G/{sum(1 for x in r24 if x['R'] <= 0)}P 24h · "
-    return (f"💓 <b>Latido</b> · equity <b>{eq:.2f}</b> USDT (libre {av:.2f}) · posiciones {n}/{MAX_POS} · {wl}"
-            f"hoy {rk.get('dayRL', 0.0) if rk.get('dayL') == str(datetime.now(TZ_NY).date()) else 0.0:+.2f}R real · "
-            f"DD {rk.get('dd', 0.0):.1f}% (pausa a {MAX_DD_PCT:g}%)" + (" · ⏸ PAUSADO" if STATE["paused"] else ""))
-
-
-def saldo_text():
-    if not (BX_KEY and BX_SECRET):
-        return "Sin API key de BingX configurada."
-    try:
-        eq, av = BX.balance()
-        pos = all_positions()
-    except Exception as ex:
-        return f"🚨 No pude leer BingX: {esc(ex)[:150]}"
-    L = [f"💰 <b>Saldo real</b> · equity {eq:.2f} USDT · libre {av:.2f}" + (" · 🧪 DRY_RUN (no se opera)" if DRY_RUN else "")]
-    for x in pos:
-        L.append(f"• {x.get('symbol')} {x.get('positionSide', '')} {float(x['positionAmt']):g} @ {x.get('avgPrice')} · PnL no realizado {x.get('unrealizedProfit', '—')}")
-    if not pos:
-        L.append("Sin posiciones abiertas en BingX.")
-    return "\n".join(L)
 
 
 # ───────────────────────── ESTADO EN DISCO ─────────────────────────
@@ -1915,7 +1956,7 @@ def day_state(sym, td):
 def trade_rec(sym, S, e):
     n = S.get("news")
     return dict(key=f"{sym}@{S['td']}", sym=sym, td=str(S["td"]), dir=e["dir"], R=round(e["R"], 4), why=e["why"],
-                mfe=round(e["mfe"], 3), coinc=S["coinc"], btc=0 if S["isBtc"] else S["btcRd"] * e["dir"],
+                mfe=round(e["mfe"], 3), coinc=S["coinc"], isbtc=S["isBtc"], nal=1 if (S["scen"] == 1 and S["nDir"] == e["dir"]) else 0, btc=0 if S["isBtc"] else S["btcRd"] * e["dir"],
                 mo=None if S["moPx"] is None else S["moFav"], wB=S["wB"], scen=S["scen"],
                 news=None if n is None else bool(n["read"] or n["hold"]))
 
@@ -1930,7 +1971,7 @@ def record_trade(sym, S, e):
         rk["day"], rk["dayR"] = t["td"], 0.0
     rk["dayR"] = rk.get("dayR", 0.0) + t["R"]
     rk["consec"] = rk.get("consec", 0) + 1 if t["R"] < 0 else 0
-    if LIVE and MAX_CONSEC_LOSS and rk["consec"] >= MAX_CONSEC_LOSS and not STATE["paused"]:
+    if LIVE and DRY_RUN and MAX_CONSEC_LOSS and rk["consec"] >= MAX_CONSEC_LOSS and not STATE["paused"]:
         STATE["paused"] = True
         tg.send(f"⏸ <b>Pausa automática</b>: {rk['consec']} pérdidas seguidas. Revisa /stats y usa /reanuda cuando decidas.")
 
@@ -1992,10 +2033,13 @@ UNI_QUIET = {"p12", "read", "open", "touch", "dead", "reject", "window"}   # en 
 
 def process(sym, end_ms, btc_bars, emit=True, deep=True):
     """emit=False: solo calcula (escaneo). deep=False: sin ancho P12 ni funding (ahorra peticiones)."""
-    bars = klines(sym, "5m", KL_LIMIT, end_ms)
-    if bars and bars[-1].t != end_ms - BAR_MS:
-        time.sleep(3)
+    try:
         bars = klines(sym, "5m", KL_LIMIT, end_ms)
+        if bars and bars[-1].t != end_ms - BAR_MS:
+            time.sleep(3)
+            bars = klines(sym, "5m", KL_LIMIT, end_ms)
+    except (MDPaused, MDBlocked):
+        return None
     if len(bars) < 300:
         if not UNIVERSE:
             log.warning(f"{sym}: pocas velas ({len(bars)})")
@@ -2146,12 +2190,21 @@ def cycle(end_ms):
         btc = klines(BTC_SYMBOL, "5m", KL_LIMIT, end_ms)
     except Exception as ex:
         log.warning(f"BTC referencia: {ex}")
+    if MD_BLOCK["until"] > time.time() and time.time() - MD_BLOCK["alert"] > 600:
+        MD_BLOCK["alert"] = time.time()
+        tg.send(f"⚠️ BingX limita las peticiones de velas hasta {datetime.fromtimestamp(MD_BLOCK['until'], TZ_LOC):%H:%M}. "
+                f"Se salta ese tramo y se reanuda solo (el SL/TP de lo abierto sigue en BingX).")
     syms = schedule(end_ms, btc) if UNIVERSE else SYMBOLS
     for s in syms:
         try:
             process(s, end_ms, btc)
         except Exception as ex:
             log.warning(f"{s}: {ex}")
+    try:
+        guard_stops()
+        equity_guard()
+    except Exception:
+        log.exception("guardianes")
     if UNIVERSE:                            # no guardar velas de lo que ya no se sigue
         keep = set(syms)
         for s, S in LAST.items():
@@ -2163,7 +2216,6 @@ def cycle(end_ms):
         STATE["digest"].append(str(td))
         tg.send(digest_text(td), silent=True)
     keepalive()
-    equity_guard()
     save_state()
     LAST_CYCLE[0] = time.time()
     HEALTH["last_cycle"] = datetime.now(timezone.utc).isoformat()
@@ -2236,6 +2288,119 @@ def run_backtest(days, top=20):
         BT_LOCK.release()
 
 
+# ───────────────────────── SWEEP: ¿qué filtro separa de verdad? ─────────────────────────
+F_OFF = dict(NIGHT="NONE", BTC="OFF", MO="OFF", W="OFF", NEWS="OFF", MIS="REDUCE")
+SWEEP_FILTERS = [
+    ("Noche: sin 'ambos lados'", lambda t: t.get("scen") != 3),
+    ("Noche: solo mismo lado alineado", lambda t: t.get("nal") == 1),
+    ("BTC: no en contra", lambda t: bool(t.get("isbtc")) or t.get("btc") != -1),
+    ("BTC: solo alineado", lambda t: bool(t.get("isbtc")) or t.get("btc") == 1),
+    ("MO: a favor", lambda t: t.get("mo") is not False),
+    ("MO: en contra", lambda t: t.get("mo") is not True),
+    ("P12: sin estrechos", lambda t: t.get("wB") != 0),
+    ("P12: sin anchos", lambda t: t.get("wB") != 2),
+    ("P12: solo normal", lambda t: t.get("wB") == 1),
+    ("Apertura coincide con el P12", lambda t: bool(t.get("coinc"))),
+]
+
+
+def collect_trades(days, top=20, F=None):
+    """Operaciones del motor SIN filtros de entrada (una por símbolo y día). Pasa los filtros a simulate() por
+    parámetro: no se tocan variables globales, así que el bot en vivo no se ve afectado."""
+    F = F or F_OFF
+    days = max(10, min(int(days), 365))
+    syms = SYMBOLS[:max(1, top)] if UNIVERSE else SYMBOLS
+    end = now_ms() // BAR_MS * BAR_MS
+    start = end - (days + int(W_LOOK * 1.6) + 4) * DAY_MS
+    first_td = (datetime.now(TZ_NY) - timedelta(days=days)).date()
+    btc = fetch_range(BTC_SYMBOL, "5m", start, end)
+    bt_btc = [b.t for b in btc]
+    allT = []
+    for sym in syms:
+        try:
+            bars = btc if sym == BTC_SYMBOL else fetch_range(sym, "5m", start, end)
+            ts = [b.t for b in bars]
+            fund = funding_hist(sym, start)
+            widths = p12_widths(bars, 140)
+            is_btc = sym.split("-")[0] == "BTC"
+            td = first_td
+            while td <= tdate(end - BAR_MS):
+                if not (SKIP_WE and td.weekday() >= 5):
+                    de = ny_ms(td + timedelta(days=1), P12S)
+                    if de <= end:
+                        j = bisect.bisect_right(ts, de - BAR_MS)
+                        win = bars[max(0, j - KL_LIMIT):j]
+                        jb = bisect.bisect_right(bt_btc, de - BAR_MS)
+                        bw = win if is_btc else btc[max(0, jb - KL_LIMIT):jb]
+                        if len(win) >= 300:
+                            S = simulate(sym, win, td, median_before(widths, td), btc_pos(bw, td, ny_ms(td, READE)), 0,
+                                         is_btc, cost=cost_rt(sym), fund=fund, news=None, F=F)
+                            if S["trade"] and not S["incomplete"]:
+                                allT.append(trade_rec(sym, S, S["trade"]))
+                td += timedelta(days=1)
+        except (MDPaused, MDBlocked) as ex:
+            log.warning(f"sweep {sym}: {ex}")
+        except Exception:
+            log.exception(f"sweep {sym}")
+    return allT
+
+
+def tstat(rs):
+    n = len(rs)
+    if n < 3:
+        return 0.0
+    sd = statistics.stdev(rs)
+    return (sum(rs) / n) / (sd / math.sqrt(n)) if sd > 0 else 0.0
+
+
+def sweep_text(T, days=0):
+    """Compara cada filtro con 'no filtrar': entrenamiento (70% de los DÍAS) vs prueba (30% final), con Bonferroni.
+    Un filtro solo se recomienda si mejora la media en ambos tramos, la prueba es > 0 y t_prueba ≥ umbral corregido."""
+    if len(T) < 30:
+        return f"🧪 Sweep: solo {len(T)} operaciones sin filtros. Con tan pocas no se decide nada: usa más días o más símbolos."
+    dias = sorted({t["td"] for t in T})
+    dcut = dias[int(len(dias) * 0.7)]
+    tr, te = [t for t in T if t["td"] < dcut], [t for t in T if t["td"] >= dcut]
+    R = lambda xs: [x["R"] for x in xs]
+    E = lambda rs: sum(rs) / len(rs) if rs else 0.0
+    crit = NormalDist().inv_cdf(1 - 0.025 / len(SWEEP_FILTERS))
+    L = [f"🧪 <b>Sweep P12</b> · {days} días · {len(T)} operaciones SIN filtros · prueba desde {dcut}",
+         f"t crítico (Bonferroni, {len(SWEEP_FILTERS)} filtros): {crit:.2f} · decide la columna PRUEBA, no la de entrenamiento",
+         f"<b>Sin filtrar</b> entren. n {len(tr)} E {E(R(tr)):+.3f}R · prueba n {len(te)} E {E(R(te)):+.3f}R t {tstat(R(te)):+.2f}", ""]
+    ok = []
+    for name, fn in SWEEP_FILTERS:
+        ftr, fte = [t for t in tr if fn(t)], [t for t in te if fn(t)]
+        if (len(ftr) == len(tr) and len(fte) == len(te)) or not ftr or not fte:
+            continue   # no cambia nada, o deja sin operaciones: no hay nada que comparar
+        t_te = tstat(R(fte))
+        good = (len(fte) >= max(10, MIN_N // 2) and E(R(ftr)) > E(R(tr)) and E(R(fte)) > E(R(te))
+                and E(R(fte)) > 0 and t_te >= crit)
+        if good:
+            ok.append(name)
+        L.append(f"{'✅' if good else '•'} {name}: entren. n {len(ftr)} E {E(R(ftr)):+.3f} · prueba n {len(fte)} E {E(R(fte)):+.3f}R t {t_te:+.2f}")
+    L.append("")
+    L.append("✅ Candidatos que superan el umbral: " + ", ".join(ok) if ok else
+             "Ningún filtro mejora de forma distinguible del azar con estos datos: déjalos en OFF.")
+    L.append("<i>Noticias: sin histórico. Un ✅ no es una orden: confírmalo en DRY_RUN antes de activarlo.</i>")
+    return "\n".join(L)
+
+
+def run_sweep(days, top=20):
+    if not BT_LOCK.acquire(blocking=False):
+        tg.send("🧪 Ya hay un backtest o sweep en marcha.")
+        return
+    try:
+        tg.send(f"🧪 Sweep de {days} días en marcha… (descargando histórico de BingX)", silent=True)
+        txt = sweep_text(collect_trades(days, top), days)
+        for i in range(0, len(txt), 3900):
+            tg.send(txt[i:i + 3900], silent=True)
+    except Exception as ex:
+        log.exception("sweep")
+        tg.send(f"🧪 Sweep falló: {esc(ex)[:200]}")
+    finally:
+        BT_LOCK.release()
+
+
 # ───────────────────────── COMANDOS ─────────────────────────
 def is_admin(uid, chat):
     if TG_ADMINS:
@@ -2273,8 +2438,6 @@ def on_cmd(cmd, args, uid, chat):
         tg.send(stats_text())
     elif cmd == "/riesgo":
         tg.send(risk_text())
-    elif cmd == "/saldo":
-        tg.send(saldo_text())
     elif cmd == "/hoy":
         dflt = (STATE.get("uni", {}).get("active") or []) if UNIVERSE else SYMBOLS
         for s in ([_sym(args[0])] if args else dflt):
@@ -2287,6 +2450,20 @@ def on_cmd(cmd, args, uid, chat):
         days = int(args[0]) if args and args[0].isdigit() else 90
         top = int(args[1]) if len(args) > 1 and args[1].isdigit() else 20
         threading.Thread(target=run_backtest, args=(days, top), daemon=True).start()
+    elif cmd == "/sweep":
+        days = int(args[0]) if args and args[0].isdigit() else 180
+        top = int(args[1]) if len(args) > 1 and args[1].isdigit() else 20
+        threading.Thread(target=run_sweep, args=(days, top), daemon=True).start()
+    elif cmd == "/hwm":
+        if not is_admin(uid, chat):
+            tg.send("Sin permiso.")
+        else:
+            try:
+                STATE["hwm"], STATE["hwm_acct"] = BX.balance()[0], acct_id()
+                save_state()
+                tg.send(f"Máximo de equity reiniciado a {STATE['hwm']:.2f} USDT.")
+            except Exception as ex:
+                tg.send(f"No se pudo leer el equity: {esc(ex)[:120]}")
     elif cmd in ("/pausa", "/reanuda", "/cerrar"):
         if not is_admin(uid, chat):
             tg.send("Sin permiso: configura TELEGRAM_ADMIN_IDS con tu id de usuario.")
@@ -2298,7 +2475,12 @@ def on_cmd(cmd, args, uid, chat):
         elif cmd == "/reanuda":
             STATE["paused"] = False
             STATE["risk"]["consec"] = 0
-            STATE["risk"]["peak"] = 0.0                       # el máximo se reinicia al saldo actual
+            real_risk()["consec"] = 0
+            try:
+                if LIVE and not DRY_RUN:
+                    STATE["hwm"], STATE["hwm_acct"] = BX.balance()[0], acct_id()
+            except Exception as ex:
+                log.warning(f"reanuda: {ex}")
             save_state()
             tg.send("▶️ Reanudado (racha de pérdidas y máximo de equity reiniciados).")
         else:
@@ -2336,17 +2518,14 @@ def watchdog():
             warned = False
 
 
+STARTUP_NOTE = []
+
+
 def main():
     log.info(f"{CODE_VERSION} · MODE={MODE} DRY_RUN={DRY_RUN} · {SYMBOLS} · estado {SF}")
     load_state()
     for k, v in (("risk", {}), ("live_res", []), ("keepalive", "")):
         STATE.setdefault(k, v)
-    if LIVE and not DRY_RUN:                                   # las "posiciones" de la etapa DRY_RUN no existen en BingX
-        stale = [s for s, L_ in STATE["live"].items() if L_.get("dry")]
-        for s in stale:
-            STATE["live"].pop(s, None)
-        if stale:
-            log.info(f"descartadas {len(stale)} posiciones simuladas de DRY_RUN: {stale}")
     if UNIVERSE:
         build_universe()
     else:
@@ -2359,13 +2538,19 @@ def main():
         eq, av = BX.balance()
         USER_TAKER[0] = BX.commission()
         log.info(f"BingX hedge={BX.is_hedge()} equity={eq:.2f} disponible={av:.2f} taker={USER_TAKER[0]}")
-        STATE["risk"]["peak"] = max(STATE["risk"].get("peak", 0.0), eq)
-        if eq <= 0:
-            tg.send("⚠️ <b>DINERO REAL activo pero el saldo USDT de futuros perpetuos es 0.</b> "
-                    "Transfiere fondos a la cuenta de Futuros Perpetuos de BingX; sin ellos no se ejecutará nada.")
-        else:
-            tg.send(f"💵 <b>DINERO REAL ACTIVO</b> · equity {eq:.2f} USDT · riesgo {RISK_PCT:g}% ≈ {eq * RISK_PCT / 100:.2f} USDT/op"
-                    + (f" (tope {MAX_RISK_USDT:g})" if MAX_RISK_USDT > 0 else "") + f" · pausa por DD {MAX_DD_PCT:g}% · /saldo /riesgo /pausa")
+        dd_update(eq)
+        try:
+            pos = BX.all_positions()
+            ajenas = [f"{x.get('symbol')} {x.get('positionSide', '')}" for x in pos if x.get("symbol") not in STATE["live"]]
+            huerf = [s for s, L_ in STATE["live"].items() if not L_.get("dry") and not any(x.get("symbol") == s for x in pos)]
+            audit = f"\n🔎 Cuenta {'DEMO' if 'vst' in BX_BASE else 'REAL'}: equity {eq:.2f} USDT · {len(pos)} posiciones abiertas"
+            if ajenas:
+                audit += f" (ajenas al bot: {', '.join(ajenas[:6])})"
+            if huerf:
+                audit += f"\n⚠️ El estado guarda posiciones que ya no existen en BingX: {', '.join(huerf)} (se concilian solas)"
+            STARTUP_NOTE.append(audit)
+        except Exception as ex:
+            log.warning(f"auditoría de cuenta: {ex}")
     if not tg.on:
         log.warning("Telegram sin configurar: solo logs")
     tg.set_commands()
@@ -2377,7 +2562,7 @@ def main():
             + (f" · TODAS las monedas (vol ≥ {fvol(MIN_VOL_USDT)}, máx {MAX_UNIVERSE}, top {TOP_N})" if UNIVERSE else f" · {', '.join(SYMBOLS)}") + "\nP12 {loc(td, P12S)}–{loc(td, P12E)} · lectura hasta {loc(td, READE)} · apertura {loc(td, OPENM)}"
             + f" · entradas hasta {loc(td, ENTE)} (hora {TZ_LOC.key})"
             + ("" if UNIVERSE else f"\nCoste {', '.join(f'{base(s)} {cost_rt(s):.3f}%' for s in SYMBOLS)}")
-            + f"{warn}\n/ayuda", silent=True)
+            + f"{warn}{''.join(STARTUP_NOTE)}\n/ayuda", silent=True)
     if TG_COMMANDS and tg.on:
         threading.Thread(target=tg.poll, args=(on_cmd,), daemon=True).start()
     threading.Thread(target=watchdog, daemon=True).start()
