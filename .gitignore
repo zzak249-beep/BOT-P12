@@ -1,5 +1,5 @@
+.env
+state.json
 __pycache__/
 *.pyc
-.env
-state/
-*.png
+.venv/
