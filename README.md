@@ -9,6 +9,13 @@ aceptación Market Profile 30m, entrada por confirmación 5m en la zona P12→mi
 - **BingX**: orden de mercado + SL y TP como órdenes condicionales en el exchange (la posición queda protegida si el bot cae). El bot mueve el SL (BE/trailing) y cierra por time stop o 15:55 NY.
 - Si no puede colocar el SL, **cierra la posición** por seguridad.
 
+## Multi-moneda (v1.2)
+- `SYMBOLS=ALL` opera todas las perpetuas USDT de BingX que pasen los filtros; `TOP:30` las 30 de mayor volumen; o una lista separada por comas.
+- **24/7 automático:** al arrancar descarta símbolos con huecos en las velas (acciones/materias primas tokenizadas), con poco historial (<3 días) o con volumen 24h < `MIN_VOLUME_USDT`. Una vez al día añade listados nuevos.
+- **Límites globales:** `MAX_OPEN_POSITIONS` y `MAX_TOTAL_RISK_PCT` se aplican entre todas las monedas (las altcoins se mueven con BTC: 3 posiciones suelen ser una sola apuesta).
+- Telegram solo avisa de monedas con operación posible hoy. `/status`, `/diag BTC`, `/close BTC|all`, `/symbols`.
+- Con muchas monedas el arranque tarda minutos (calentamiento de velas) y cada vela de 5 min implica una petición por moneda.
+
 ## Seguridad añadida (v1.1)
 - **Freno por drawdown**: si el DD acumulado supera `MAX_DD_R` (8R por defecto) el bot se pausa solo y te avisa. `/resume` + `/resetdd` para continuar.
 - **Funding** descontado del R de cada operación (`FUND_H`, `FUND_PCT`).

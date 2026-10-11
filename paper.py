@@ -12,6 +12,8 @@ class PaperBroker:
     def equity(self): return self.eq
     def record_pnl(self, usd): self.eq += usd
     def min_qty(self): return 0.0
+    def min_cost(self): return 0.0
+    def ensure_setup(self): pass
     def round_qty(self, q): return math.floor(q * 1e6) / 1e6
 
     def open(self, side, qty, ref):

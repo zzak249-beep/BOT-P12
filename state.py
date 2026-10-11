@@ -6,13 +6,17 @@ import os
 class Store:
     def __init__(self, path):
         self.path = path
-        self.d = {"loss_streak": 0, "traded_day": None, "pos": None, "paused": False, "trades": []}
+        self.d = {"loss_streak": 0, "traded_day": {}, "positions": {}, "paused": False, "trades": []}
         if path and os.path.exists(path):
             try:
                 with open(path) as f:
                     self.d.update(json.load(f))
             except Exception:
                 pass
+        if not isinstance(self.d.get("traded_day"), dict):
+            self.d["traded_day"] = {}
+        if not isinstance(self.d.get("positions"), dict):
+            self.d["positions"] = {}
 
     def save(self):
         if not self.path:

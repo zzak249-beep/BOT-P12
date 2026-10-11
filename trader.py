@@ -13,6 +13,27 @@ from engine import Bar, in_rng, ny_mins, NY, BAR_MS
 log = logging.getLogger("trader")
 
 
+def fp(x):
+    """Precio con 6 cifras significativas (vale para BTC y para monedas de 0.0001)."""
+    return "—" if x is None else f"{x:.6g}"
+
+
+class Book:
+    """Límites globales entre símbolos: nº de posiciones y riesgo total abierto."""
+
+    def __init__(self, cfg, store):
+        self.cfg, self.store = cfg, store
+
+    def allow(self, risk_pct):
+        pos = self.store.d.get("positions", {})
+        if len(pos) >= self.cfg.max_open:
+            return False, f"máximo de posiciones abiertas ({self.cfg.max_open})"
+        tot = sum(p.get("risk_pct", 0.0) for p in pos.values())
+        if tot + risk_pct > self.cfg.max_total_risk + 1e-9:
+            return False, f"riesgo total {tot + risk_pct:.2f}% > {self.cfg.max_total_risk}%"
+        return True, ""
+
+
 @dataclass
 class Pos:
     side: int
@@ -30,12 +51,19 @@ class Pos:
     trail_stop: float | None = None
     realized: float = 0.0
     stop_ids: list = field(default_factory=list)
+    risk_pct: float = 0.0
 
 
 class Trader:
-    def __init__(self, cfg, engine, broker, notify, store):
+    def __init__(self, cfg, engine, broker, notify, store, sym=None, book=None, quiet=False):
         self.cfg, self.eng, self.broker, self.n, self.store = cfg, engine, broker, notify, store
-        self.pos: Pos | None = Pos(**store.d["pos"]) if store.d.get("pos") else None
+        self.sym = sym or cfg.symbol
+        self.name = self.sym.split("/")[0]
+        self.book, self.quiet = book, quiet
+        self._book_msg_day = None
+        store.d.setdefault("positions", {})
+        pd = store.d["positions"].get(self.sym)
+        self.pos: Pos | None = Pos(**pd) if pd else None
         self.eng.loss_streak = store.d.get("loss_streak", 0)
         self.trades: list[float] = []
         self.trade_log: list[tuple] = []
@@ -43,7 +71,10 @@ class Trader:
 
     # ───────────── persistencia ─────────────
     def _save(self):
-        self.store.d["pos"] = asdict(self.pos) if self.pos else None
+        if self.pos:
+            self.store.d["positions"][self.sym] = asdict(self.pos)
+        else:
+            self.store.d["positions"].pop(self.sym, None)
         self.store.d["loss_streak"] = self.eng.loss_streak
         self.store.save()
 
@@ -51,6 +82,7 @@ class Trader:
     def on_bar(self, b: Bar, live: bool, fresh: bool = True):
         if live and self.pos and b.t > self.pos.entry_t:
             self._manage(b)
+        self.eng.loss_streak = self.store.d.get("loss_streak", 0)
         sig, events = self.eng.on_bar(b, flat=self.pos is None)
         if not live:
             return
@@ -66,21 +98,26 @@ class Trader:
     # ───────────── eventos del motor ─────────────
     def _event(self, kind, data):
         e, c = self.eng, self.cfg
+        if self.quiet and kind != "open":
+            log.info("%s: %s", self.sym, data)
+            return
         if kind == "open":
+            if self.quiet and (e.bias == 0 or (c.skip_weekends and e.weekend)):
+                return
             if e.bias != 0 and not (c.skip_weekends and e.weekend):
                 lim = datetime.now(NY).replace(hour=self.eng.entE // 60, minute=self.eng.entE % 60)
                 lim_loc = lim.astimezone(ZoneInfo(c.tz_local)).strftime("%H:%M")
                 extra = (f"Vol. lectura ×{e.rvol_read:.2f} · " if e.rvol_read is not None else "") + \
                         (f"mom 24h {e.mom_ret * 100:+.1f}%\n" if e.mom_ret is not None else "\n" if e.rvol_read is not None else "")
                 self.n.send(
-                    f"📊 <b>P12 · Lectura del día</b> {self.tag}\n{e.scen_text()} · {e.read_text()}\n"
+                    f"📊 <b>P12 · {self.name}</b> {self.tag}\n{e.scen_text()} · {e.read_text()}\n"
                     f"{'🟢 BUSCA COMPRAS' if e.bias == 1 else '🔴 BUSCA VENTAS'}\n"
-                    f"Zona: {e.zEdge:.2f} → {e.zDeep:.2f}\nSL: {e.stopPx:.2f}\n"
+                    f"Zona: {fp(e.zEdge)} → {fp(e.zDeep)}\nSL: {fp(e.stopPx)}\n"
                     f"Apertura {'coincide' if e.coinc else 'NO coincide'} · tamaño ×{e.sz_mult:.2f}\n"
                     f"{extra}"
                     f"Entradas hasta {lim_loc} ({c.tz_local})")
             else:
-                self.n.send(f"✋ <b>P12</b> Hoy no se opera: {', '.join(e.why) or 'sin condiciones'} · {e.scen_text()} · {e.read_text()}")
+                self.n.send(f"✋ <b>P12 {self.name}</b> Hoy no se opera: {', '.join(e.why) or 'sin condiciones'} · {e.scen_text()} · {e.read_text()}")
         else:
             self.n.send(f"ℹ️ P12: {data}")
 
@@ -88,12 +125,23 @@ class Trader:
     def _enter(self, s, b):
         c, br = self.cfg, self.broker
         try:
+            risk_used = c.risk_pct * s["sz_mult"]
+            if self.book:
+                ok, why = self.book.allow(risk_used)
+                if not ok:
+                    if self._book_msg_day != s["day_id"]:
+                        self._book_msg_day = s["day_id"]
+                        self.n.send(f"⏭ {self.tag}Señal {self.name} ignorada: {why}")
+                    return
             eq = c.equity_override or br.equity()
-            qty = eq * c.risk_pct / 100 / s["r_unit"] * s["sz_mult"]
-            qty = min(qty, eq * c.leverage * 0.95 / s["entry_adj"])
+            qty = eq * risk_used / 100 / s["r_unit"]
+            qty = min(qty, eq * c.leverage * 0.95 / max(1, c.max_open) / s["entry_adj"])
             qty = br.round_qty(qty)
+            if qty * s["entry_adj"] < br.min_cost():
+                self.n.send(f"⚠️ {self.tag}{self.name}: orden de {qty * s['entry_adj']:.2f} USDT < mínimo del exchange ({br.min_cost()}).")
+                return
             if qty <= 0 or qty < br.min_qty():
-                self.n.send(f"⚠️ {self.tag}Señal válida pero cantidad {qty} < mínimo del exchange ({br.min_qty()}). Sube el capital o el riesgo.")
+                self.n.send(f"⚠️ {self.tag}{self.name}: cantidad {qty} < mínimo del exchange ({br.min_qty()}). Sube el capital o el riesgo.")
                 return
             side = s["side"]
             fill = br.open(side, qty, s["ref"])
@@ -101,10 +149,10 @@ class Trader:
             if r_unit <= 0 or (fill - s["stop"]) * side <= 0:
                 raise RuntimeError("El precio de entrada quedó más allá del stop")
             pos = Pos(side=side, qty0=qty, qty=qty, entry=fill, r_unit=r_unit, sl=s["stop"],
-                      tp=self.eng.calc_target(fill, side, r_unit), entry_t=b.t, day_id=s["day_id"])
+                      tp=self.eng.calc_target(fill, side, r_unit), entry_t=b.t, day_id=s["day_id"], risk_pct=risk_used)
             self.pos = pos
             self.eng.mark_traded()
-            self.store.d["traded_day"] = s["day_id"]
+            self.store.d.setdefault("traded_day", {})[self.sym] = s["day_id"]
             try:
                 br.set_stops(pos)
             except Exception as e:  # sin stop no se mantiene la posición
@@ -116,9 +164,9 @@ class Trader:
                 return
             self._save()
             self.n.send(
-                f"{'🟢 LARGO' if side == 1 else '🔴 CORTO'} {self.tag}<b>{c.symbol}</b>\n"
-                f"Entrada: {fill:.2f}\nSL: {pos.sl:.2f}\nTP: {pos.tp:.2f}\n"
-                f"Cantidad: {qty} · Riesgo {c.risk_pct * s['sz_mult']:.2f}% · R = {r_unit:.2f}")
+                f"{'🟢 LARGO' if side == 1 else '🔴 CORTO'} {self.tag}<b>{self.sym}</b>\n"
+                f"Entrada: {fp(fill)}\nSL: {fp(pos.sl)}\nTP: {fp(pos.tp)}\n"
+                f"Cantidad: {qty} · Riesgo {c.risk_pct * s['sz_mult']:.2f}% · R = {fp(r_unit)}")
         except Exception as e:
             log.exception("enter")
             self.n.send(f"🚨 {self.tag}Error al entrar: {e}")
@@ -148,7 +196,7 @@ class Trader:
                 p.realized += d * (px - p.entry) * q
                 p.qty = round(p.qty - q, 8)
                 changed = True
-                self.n.send(f"💰 {self.tag}Parcial {c.partial_pct:.0f}% a +{c.partial_r}R @ {px:.2f}")
+                self.n.send(f"💰 {self.tag}Parcial {c.partial_pct:.0f}% a +{c.partial_r}R @ {fp(px)}")
             p.partial_done = True
 
         if c.trail_act_r > 0 and fav >= c.trail_act_r * p.r_unit and self.eng.atr:
@@ -203,10 +251,10 @@ class Trader:
         d["sum_win"] = d.get("sum_win", 0.0) + max(r, 0)
         d["sum_loss"] = d.get("sum_loss", 0.0) + max(-r, 0)
         d["max_dd"] = max(d.get("max_dd", 0.0), d["peak_r"] - d["eq_r"])
-        d["trades"] = (d.setdefault("trades", []) + [{"day": p.day_id, "side": p.side, "r": round(r, 3), "why": reason}])[-200:]
+        d["trades"] = (d.setdefault("trades", []) + [{"day": p.day_id, "sym": self.name, "side": p.side, "r": round(r, 3), "why": reason}])[-200:]
         self.pos = None
         self._save()
-        self.n.send(f"{'✅' if r > 0 else '❌'} {self.tag}Cierre <b>{reason}</b> @ {px:.2f} · {r:+.2f}R"
+        self.n.send(f"{'✅' if r > 0 else '❌'} {self.tag}<b>{self.name}</b> cierre <b>{reason}</b> @ {fp(px)} · {r:+.2f}R"
                     f"{f' (funding {n_fund}×)' if n_fund else ''}\n"
                     f"Racha pérdidas: {self.eng.loss_streak} · Acumulado: {d['eq_r']:+.2f}R · DD: {d['peak_r'] - d['eq_r']:.1f}R")
         dd = d["peak_r"] - d["eq_r"]
@@ -241,25 +289,20 @@ class Trader:
         if res:
             self._close(*res)
 
-    def reconcile(self):
-        """Al arrancar: compara estado guardado con el exchange."""
-        if self.broker.paper:
+    def reconcile(self, ex_syms):
+        """Al arrancar: si el estado guardado tiene posición y el exchange ya no, resuélvela."""
+        if self.broker.paper or not self.pos or self.sym in ex_syms:
             return
-        sides = [s for s in (1, -1) if self.broker.has_position(s)]
-        if self.pos and not sides:
-            res = self.broker.poll_exit(self.pos)
-            if res:
-                self.n.send("ℹ️ La posición se cerró mientras el bot estaba apagado.")
-                self._close(*res)
-        elif sides and not self.pos:
-            self.n.send("⚠️ Hay una posición abierta en BingX que el bot NO conoce (sin estado guardado). "
-                        "No la gestionaré. Revisa SL/TP a mano. ¿Montaste el Volume en /data?")
+        res = self.broker.poll_exit(self.pos)
+        if res:
+            self.n.send(f"ℹ️ {self.name}: la posición se cerró mientras el bot estaba apagado.")
+            self._close(*res)
 
     def diag(self):
         e, c, br = self.eng, self.cfg, self.broker
         s = [f"<b>Diagnóstico</b>",
              f"DRY_RUN={c.dry_run} · DEMO={c.demo} → {'⚠️ SOLO SIMULA, NO OPERA EN BINGX' if br.paper else 'envía órdenes a BingX'}",
-             f"Pausa manual/freno: {self.store.d.get('paused', False)} · símbolo {c.symbol} · apal. {c.leverage}x"]
+             f"Pausa manual/freno: {self.store.d.get('paused', False)} · símbolo {self.sym} · apal. {c.leverage}x"]
         if not br.paper:
             d = br.diag()
             s.append(f"Equity: {d['equity']} · cantidad mínima: {d['min_qty']} · modo hedge: {d['hedge']}")
@@ -269,7 +312,7 @@ class Trader:
             if e.why:
                 s.append("Motivo de no operar: " + ", ".join(e.why))
             if e.bias:
-                s.append(f"Zona {e.zEdge:.2f}→{e.zDeep:.2f} · SL {e.stopPx:.2f} · tesis rota: {e.dead} · ya operó hoy: {e.traded}")
+                s.append(f"Zona {fp(e.zEdge)}→{fp(e.zDeep)} · SL {fp(e.stopPx)} · tesis rota: {e.dead} · ya operó hoy: {e.traded}")
                 s.append(f"Rechazos: coste={e.rej_cost} stop%={e.rej_stop} · tamaño ×{e.sz_mult:.2f}")
         s.append("Ventana de entrada: 09:30–12:00 Nueva York.")
         return "\n".join(s)
@@ -284,7 +327,7 @@ class Trader:
         log_ = []
         pos = None
         try:
-            px = float(br.ex.fetch_ticker(c.symbol)["last"])
+            px = float(br.ex.fetch_ticker(self.sym)["last"])
             q = br.round_qty(max(br.min_qty(), 0.0001))
             log_.append(f"1) Precio {px} · qty {q}")
             fill = br.open(1, q, px)
@@ -314,7 +357,7 @@ class Trader:
     def status(self):
         e, c = self.eng, self.cfg
         mode = "PAPER (solo señales)" if self.broker.paper else ("DEMO" if c.demo else "REAL")
-        s = [f"<b>P12 Hunter</b> · {c.symbol} · modo {mode}"]
+        s = [f"<b>P12 Hunter</b> · {self.sym} · modo {mode}"]
         s.append(f"Pausa manual: {'SÍ' if self.store.d.get('paused') else 'no'} · racha pérdidas: {e.loss_streak}")
         if e.open_done:
             s.append(f"Hoy: {e.scen_text()} · {e.read_text()} · sesgo {'COMPRAS' if e.bias==1 else 'VENTAS' if e.bias==-1 else 'ninguno'}"
@@ -325,7 +368,7 @@ class Trader:
             s.append("Lectura en curso / fuera de sesión")
         if self.pos:
             p = self.pos
-            s.append(f"Posición: {'LARGO' if p.side==1 else 'CORTO'} {p.qty} @ {p.entry:.2f} · SL {p.sl:.2f} · TP {p.tp:.2f}"
+            s.append(f"Posición: {'LARGO' if p.side==1 else 'CORTO'} {p.qty} @ {fp(p.entry)} · SL {fp(p.sl)} · TP {fp(p.tp)}"
                      + (" · trailing" if p.trail_on else ""))
         if self.trades:
             s.append(f"Esta sesión: {len(self.trades)} ops · {sum(self.trades):+.2f}R")

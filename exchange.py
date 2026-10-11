@@ -45,31 +45,46 @@ def fetch_candles(ex, symbol, since, until=None, page=1000):
     return [out[k] for k in sorted(out)]
 
 
+def make_exchange(cfg):
+    ex = ccxt.bingx({"apiKey": cfg.api_key, "secret": cfg.api_secret, "enableRateLimit": True,
+                     "options": {"defaultType": "swap"}})
+    if cfg.demo:
+        ex.set_sandbox_mode(True)  # cuenta demo (VST)
+    ex.load_markets()
+    try:
+        ex.set_position_mode(True)  # hedge, a nivel de cuenta
+    except Exception as e:
+        log.warning("set_position_mode: %s", e)
+    return ex
+
+
 class BingxBroker:
     paper = False
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, sym=None, ex=None):
         self.cfg = cfg
-        self.sym = cfg.symbol
-        self.ex = ccxt.bingx({"apiKey": cfg.api_key, "secret": cfg.api_secret, "enableRateLimit": True,
-                              "options": {"defaultType": "swap"}})
-        if cfg.demo:
-            self.ex.set_sandbox_mode(True)  # cuenta demo (VST)
-        self.ex.load_markets()
+        self.sym = sym or cfg.symbol
+        self.ex = ex or make_exchange(cfg)
         self.m = self.ex.market(self.sym)
-        for fn, args in (
-            (self.ex.set_position_mode, (True, self.sym)),
-            (self.ex.set_margin_mode, ("isolated", self.sym)),
-        ):
-            try:
-                fn(*args)
-            except Exception as e:
-                log.warning("setup %s: %s", fn.__name__, e)
+        self._ready = False
+
+    def ensure_setup(self):
+        """Margen aislado y apalancamiento, una vez por símbolo (justo antes de la primera orden)."""
+        if self._ready:
+            return
+        try:
+            self.ex.set_margin_mode("isolated", self.sym)
+        except Exception as e:
+            log.warning("margin %s: %s", self.sym, e)
         for side in ("LONG", "SHORT"):
             try:
-                self.ex.set_leverage(cfg.leverage, self.sym, {"side": side})
+                self.ex.set_leverage(self.cfg.leverage, self.sym, {"side": side})
             except Exception as e:
-                log.warning("leverage %s: %s", side, e)
+                log.warning("leverage %s %s: %s", self.sym, side, e)
+        self._ready = True
+
+    def min_cost(self):
+        return float((self.m.get("limits", {}).get("cost", {}) or {}).get("min") or 0)
 
     # ── utilidades ──
     def _ps(self, side): return "LONG" if side == 1 else "SHORT"
@@ -111,6 +126,7 @@ class BingxBroker:
 
     # ── órdenes ──
     def open(self, side, qty, ref):
+        self.ensure_setup()
         o = self.ex.create_order(self.sym, "market", "buy" if side == 1 else "sell", qty, None,
                                  {"positionSide": self._ps(side)})
         time.sleep(1.5)

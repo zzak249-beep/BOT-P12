@@ -17,6 +17,12 @@ class Config:
         self.tg_token = e("TELEGRAM_TOKEN", "")
         self.tg_chat = e("TELEGRAM_CHAT_ID", "")
         self.symbol = e("SYMBOL", "BTC/USDT:USDT")
+        self.symbols = e("SYMBOLS", "").strip()          # "" = solo SYMBOL | "A,B" | "TOP:30" | "ALL"
+        self.min_volume = float(e("MIN_VOLUME_USDT", "10000000"))  # volumen 24h mínimo (modo ALL/TOP)
+        self.max_symbols = int(e("MAX_SYMBOLS", "150"))
+        self.exclude = {x.strip().upper() for x in e("EXCLUDE", "").split(",") if x.strip()}
+        self.max_open = int(e("MAX_OPEN_POSITIONS", "3"))
+        self.max_total_risk = float(e("MAX_TOTAL_RISK_PCT", "1.0"))  # suma de riesgo de posiciones abiertas
         self.leverage = int(e("LEVERAGE", "10"))
         self.equity_override = float(e("EQUITY_OVERRIDE", "0"))  # 0 = leer saldo real
         self.paper_equity = float(e("PAPER_EQUITY", "1000"))

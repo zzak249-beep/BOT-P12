@@ -45,12 +45,12 @@ class Notifier:
                     m = u.get("message") or {}
                     if str(m.get("chat", {}).get("id")) != self.chat:
                         continue  # ignora a cualquiera que no seas tú
-                    cmd = (m.get("text") or "").split()[:1]
-                    if not cmd:
+                    parts = (m.get("text") or "").split()
+                    if not parts:
                         continue
-                    h = handlers.get(cmd[0].lower().split("@")[0])
+                    h = handlers.get(parts[0].lower().split("@")[0])
                     if h:
-                        self.send(h())
+                        self.send(h(" ".join(parts[1:])))
             except Exception as e:
                 log.warning("getUpdates: %s", e)
                 time.sleep(5)
