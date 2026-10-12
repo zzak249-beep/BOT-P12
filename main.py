@@ -17,11 +17,28 @@ MIN_BARS = 3 * 288          # mínimo 3 días de historial para operar un símbo
 MIN_COVERAGE = 0.97         # <97% de velas 5m presentes ⇒ no es 24/7 (acciones/materias primas tokenizadas)
 
 
+def norm_symbol(x):
+    """Acepta BTC, BTCUSDT, BTC-USDT, BTC/USDT, BTCUSDT.P o el formato ccxt BTC/USDT:USDT."""
+    x = x.strip().upper().replace(".P", "")
+    if not x or x.startswith("TOP:") or x == "ALL":
+        return x
+    if "/" in x and ":" in x:
+        return x
+    for sep in ("-", "/", "_"):
+        if sep in x:
+            base, quote = x.split(sep)[:2]
+            return f"{base}/{quote}:{quote}"
+    for q in ("USDT", "USDC"):
+        if x.endswith(q) and len(x) > len(q):
+            return f"{x[:-len(q)]}/{q}:{q}"
+    return f"{x}/USDT:USDT"
+
+
 def select_symbols(cfg, ex):
     spec = cfg.symbols or cfg.symbol
     up = spec.upper()
     if up != "ALL" and not up.startswith("TOP:"):
-        return [x.strip() for x in spec.split(",") if x.strip()]
+        return [norm_symbol(x) for x in spec.split(",") if x.strip()]
     try:
         tick = ex.fetch_tickers()
     except Exception as e:
@@ -81,6 +98,10 @@ class Bot:
         for s in self.store.d["positions"]:           # las posiciones abiertas se gestionan siempre
             if s not in syms:
                 syms.insert(0, s)
+        for s in [s for s in syms if s not in self.ex.markets]:
+            self.skipped[s] = "no existe en BingX"
+            log.error("Símbolo '%s' no existe en BingX perpetuos (¿SYMBOLS bien escrito?)", s)
+        syms = [s for s in syms if s in self.ex.markets]
         self.multi = len(syms) > 1
         warm = self.cfg.warmup_days if len(syms) <= 10 else min(self.cfg.warmup_days, 10)
         self.n.send(f"⏳ Calentando {len(syms)} símbolo(s) con {warm} días de velas…")
