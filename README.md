@@ -33,6 +33,15 @@ aceptación Market Profile 30m, entrada por confirmación 5m en la zona P12→mi
 - `RVOL_MIN`: volumen mínimo en las velas de aceptación (ya existía).
 - **No los actives sin probarlos:** `python compare.py --days 365` compara cada variante con la base, separando entrenamiento (70%) y test (30%), y calcula el umbral de |t| ajustado por el número de variantes probadas.
 
+## Si no recibes nada o no opera (checklist)
+1. **Al arrancar debes recibir 3 mensajes** (⏳ Calentando, ✅ símbolos activos, 🤖 iniciado). Si no llega ninguno: mira los logs de Railway.
+   - `TELEGRAM NO FUNCIONA: ...` → token mal copiado, o no has pulsado **/start** en tu bot, o `TELEGRAM_CHAT_ID` no es tu id numérico.
+   - `fallo al arrancar` → el mensaje 🚨 de Telegram y el log traen el error exacto.
+2. **Cada día a las 09:40 NY (15:40 Madrid)** llega el 📊 resumen: monedas leídas y cuáles tienen operación posible. Si llega con 0 candidatas, el bot funciona pero ninguna cumplió la lectura (es lo normal muchos días).
+3. `/ping` (¿vive?), `/diag` (modo, saldo, última vela procesada), `/testorder` (prueba la orden real en BingX).
+4. `DRY_RUN=false` y `BINGX_DEMO=false` para operar en real. Con `DRY_RUN=true` solo hay señales y paper trading.
+5. Saldo en la cuenta de **Futuros Perpetuos** (no Spot) y permisos de la API: Futuros/Trade.
+
 ## Modos (sube de nivel solo cuando el anterior funcione)
 1. `DRY_RUN=true` → solo señales por Telegram + paper trading simulado. No necesita API keys de BingX.
 2. `DRY_RUN=false` + `BINGX_DEMO=true` → órdenes reales en la cuenta demo VST de BingX.

@@ -1,10 +1,11 @@
 """P12 Hunter bot — BingX multi-moneda + Telegram. Punto de entrada para Railway."""
 import logging
 import time
+from datetime import datetime
 from types import SimpleNamespace
 
 from config import Config
-from engine import Engine, BAR_MS
+from engine import Engine, BAR_MS, NY
 from notifier import Notifier
 from state import Store
 from trader import Trader, Book, fp
@@ -24,16 +25,17 @@ def select_symbols(cfg, ex):
     try:
         tick = ex.fetch_tickers()
     except Exception as e:
-        log.warning("fetch_tickers: %s", e)
+        log.warning("fetch_tickers falló (%s): sin filtro de volumen", e)
         tick = {}
+    no_vol = not any((v or {}).get("quoteVolume") for v in tick.values())
     rows = []
     for s, m in ex.markets.items():
-        if not (m.get("swap") and m.get("linear") and m.get("quote") == "USDT" and m.get("active", True)):
+        if not (m.get("swap") and m.get("linear") and m.get("quote") == "USDT" and m.get("active") is not False):
             continue
         if (m.get("base") or "").upper() in cfg.exclude:
             continue
         q = float((tick.get(s) or {}).get("quoteVolume") or 0)
-        if q < cfg.min_volume:
+        if not no_vol and q < cfg.min_volume:
             continue
         rows.append((q, s))
     rows.sort(reverse=True)
@@ -50,6 +52,8 @@ class Bot:
         self.skipped = {}
         self.last_refresh = time.time()
         self.multi = False
+        self.last_progress = time.time()
+        self.last_warn = 0
 
     # ── alta de símbolos ──
     def add(self, sym, now, warm_days):
@@ -70,8 +74,9 @@ class Bot:
         self.U[sym] = SimpleNamespace(sym=sym, eng=eng, tr=tr, last_t=bars[-1].t)
         return True
 
-    def setup(self):
-        now = int(time.time() * 1000)
+    def setup(self, now=None):
+        now = now or int(time.time() * 1000)
+        self.summary_day = None
         syms = select_symbols(self.cfg, self.ex)
         for s in self.store.d["positions"]:           # las posiciones abiertas se gestionan siempre
             if s not in syms:
@@ -113,6 +118,10 @@ class Bot:
 
     # ── bucle ──
     def tick(self, now):
+        d = datetime.fromtimestamp(now / 1000, NY)
+        if 580 <= d.hour * 60 + d.minute < 720 and getattr(self, 'summary_day', None) != d.date():
+            self.summary_day = d.date()
+            self.summary(d)
         due = [u for u in self.U.values() if now >= u.last_t + 2 * BAR_MS + 3000]
 
         def prio(u):
@@ -125,8 +134,12 @@ class Bot:
                 for b in [x for x in rows if x.t > u.last_t and x.t + BAR_MS <= now - 1000]:
                     u.tr.on_bar(b, live=True, fresh=now - (b.t + BAR_MS) < 180_000)
                     u.last_t = b.t
+                    self.last_progress = time.time()
             except Exception as e:
                 log.warning("tick %s: %s", u.sym, e)
+        if time.time() - self.last_progress > 900 and time.time() - self.last_warn > 3600:
+            self.last_warn = time.time()
+            self.n.send("⚠️ Hace más de 15 min que no llegan velas nuevas de BingX. Revisa los logs de Railway.")
         for u in list(self.U.values()):
             if u.tr.pos:
                 u.tr.poll()
@@ -139,6 +152,20 @@ class Bot:
                     self.skipped[s] = f"error: {str(e)[:60]}"
         if time.time() - self.last_refresh > 86_400 and self.multi:
             self.refresh()
+
+    def summary(self, d):
+        c = self.cfg
+        if c.skip_weekends and d.isoweekday() >= 6:
+            self.n.send("📊 <b>P12</b> Fin de semana: no se opera.")
+            return
+        rd = [u for u in self.U.values() if u.eng.open_done]
+        cands = [u for u in rd if u.eng.bias != 0]
+        no_acc = sum(1 for u in rd if u.eng.rd == 0)
+        filt = sum(1 for u in rd if u.eng.rd != 0 and u.eng.bias == 0)
+        tags = " ".join(f"{u.tr.name}{'▲' if u.eng.bias == 1 else '▼'}" for u in cands[:30])
+        self.n.send(f"📊 <b>P12 · resumen 09:40 NY</b>\n{len(rd)}/{len(self.U)} monedas leídas · "
+                    f"<b>{len(cands)}</b> con operación posible{': ' + tags if tags else ''}\n"
+                    f"{no_acc} sin aceptación · {filt} filtradas\nEntradas hasta 12:00 NY")
 
     # ── comandos ──
     def find(self, arg):
@@ -180,7 +207,10 @@ class Bot:
         if u:
             return u.tr.diag()
         c = self.cfg
+        newest = max(u.last_t for u in self.U.values())
+        age = int(time.time() - (newest + BAR_MS) / 1000)
         s = [f"<b>Diagnóstico global</b>",
+             f"Última vela procesada: {datetime.fromtimestamp(newest / 1000, NY).strftime('%d/%m %H:%M')} NY (hace {age // 60} min)",
              f"DRY_RUN={c.dry_run} · DEMO={c.demo} → {'⚠️ SOLO SIMULA, NO OPERA EN BINGX' if c.dry_run else 'envía órdenes a BingX'}",
              f"Símbolos activos {len(self.U)} · descartados {len(self.skipped)} · pausa {self.store.d.get('paused', False)}",
              f"Límites: {c.max_open} posiciones · riesgo total {c.max_total_risk}% · riesgo/op {c.risk_pct}% · apal. {c.leverage}x"]
@@ -246,17 +276,26 @@ def main():
         ex = make_exchange(cfg)
         mk = lambda sym: BingxBroker(cfg, sym, ex)
 
+    err = notify.check()
+    if err:
+        log.error("TELEGRAM NO FUNCIONA: %s", err)
     store = Store(cfg.state_path)
     store.d.setdefault("positions", {})
     bot = Bot(cfg, ex, mk, notify, store, fetch_candles)
-    bot.setup()
+    try:
+        bot.setup()
+    except BaseException as e:
+        log.exception("fallo al arrancar")
+        notify.send(f"🚨 El bot no pudo arrancar: {type(e).__name__}: {str(e)[:300]}")
+        raise
 
     any_tr = next(iter(bot.U.values())).tr
     notify.start_commands({
         "/status": bot.g_status, "/diag": bot.g_diag, "/pause": bot.g_pause, "/resume": bot.g_resume,
         "/close": bot.g_close, "/testorder": bot.g_test, "/symbols": bot.g_symbols,
         "/stats": lambda a="": any_tr.stats(), "/resetdd": lambda a="": any_tr.reset_dd(),
-        "/help": lambda a="": "/status [BTC] · /diag [BTC] · /stats · /symbols · /pause · /resume · /close [BTC|all] · /testorder [BTC] · /resetdd"})
+        "/ping": lambda a="": "pong ✅ el bot está vivo",
+        "/help": lambda a="": "/ping · /status [BTC] · /diag [BTC] · /stats · /symbols · /pause · /resume · /close [BTC|all] · /testorder [BTC] · /resetdd"})
     notify.send(f"🤖 <b>P12 Hunter v4.6</b> iniciado · {len(bot.U)} símbolos · "
                 f"{'PAPER (solo señales)' if cfg.dry_run else 'DEMO' if cfg.demo else 'REAL'}\n/help para comandos")
 
